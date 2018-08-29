@@ -39,6 +39,15 @@ class Driver
    * @brief Capture, publish and sleep
    */
   void proceed();
+  
+  /**
+   * @brief get the number of subscribers
+   */
+  inline uint32_t getNumSubscribers() const
+  {
+    return camera_->getNumSubscribers();     
+  }
+  
  private:
   /**
    * @brief ROS private node for getting ROS parameters.

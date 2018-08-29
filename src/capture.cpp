@@ -167,8 +167,8 @@ bool Capture::capture()
 }
 
 void Capture::publish()
-{
-  pub_.publish(*getImageMsgPtr(), info_);
+{  
+  pub_.publish(*getImageMsgPtr(), info_); 
 }
 
 bool Capture::setPropertyFromParam(int property_id, const std::string &param_name)

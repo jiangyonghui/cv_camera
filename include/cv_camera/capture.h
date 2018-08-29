@@ -151,6 +151,11 @@ public:
    * @return true if success
    */
   bool setPropertyFromParam(int property_id, const std::string &param_name);
+  
+  inline uint32_t getNumSubscribers() const
+  {
+    return pub_.getNumSubscribers();
+  }
 
 private:
   /**
@@ -212,9 +217,12 @@ private:
   /**
    * @brief rescale_camera_info param value
    */
-  bool rescale_camera_info_;
+  bool rescale_camera_info_;  
 };
 
 } // namespace cv_camera
 
 #endif // CV_CAMERA_CAPTURE_H
+
+
+

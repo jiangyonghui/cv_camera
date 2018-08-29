@@ -7,13 +7,22 @@ int main(int argc, char **argv)
   ros::init(argc, argv, "cv_camera");
   ros::NodeHandle private_node("~");
   cv_camera::Driver driver(private_node, private_node);
-
+  
+  bool wait_for_subscriber = false;
+  private_node.getParam("wait_for_subscriber", wait_for_subscriber);
+  
   try
   {
     driver.setup();
     while (ros::ok())
     {
-      driver.proceed();
+      if (wait_for_subscriber)
+      {
+        if (driver.getNumSubscribers()) {driver.proceed();}
+        else {ROS_WARN_ONCE("No subscribers connected!");}
+      }
+      else {driver.proceed();}
+      
       ros::spinOnce();
     }
   }
