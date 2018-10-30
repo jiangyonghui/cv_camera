@@ -1,0 +1,1024 @@
+% !TeX root = ../thesis.tex
+
+\chapter{Pipeline Design}
+\label{sec:pipeline_design}
+
+In this chapter, we will walk through the pipeline and explain how different modules interact with each other. Firstly an overview of the pipeline architecture is presented, then the functionality of different modules will be introduced. At last, from the perspective of implementation, we summarize the APIs of the pipeline for application and further development. 
+
+%% Intro to pipeline architecture
+\section{Pipeline Architecture}
+
+The pipeline mainly consists of eight modules, i.e. Source Provider, Person Detector, Person Tracker, Feature Extractor, Data Manager, Action Predictor, Visual Agency and Utilities, which interact with each other via ROS Message/Topic mechanism (see Section \ref{ros:computaion_graph}). We basically set up publishers and subscribers in different nodes to transport the data flow. Figure \ref{fig:pipe_module} provides an overview of the pipeine modules and the messages between them, while Figure \ref{fig:pipe_msg} reveals more details about the ROS nodes and message topics between nodes, where each ellipse stands for a ROS node and the following rectangle holds the required message topics under the ROS node. Based on the modules, two scenarios will be discussed here. 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/PipeArch/pipe_module.png}
+  \caption{Pipeline Modules and Messages}
+  \label{fig:pipe_module}
+\end{figure}
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=1.0\linewidth]{PipelineDesign/PipeArch/pipe_msg.png}
+  \caption{Pipeline ROS Nodes and Message Topics}
+  \label{fig:pipe_msg}
+\end{figure}
+
+\textbf{Single-Person vs. Multi-Person Scenario}
+
+In the case of single agent, the RGB image from \textit{Source Provider} could be directly fed into \textit{Feature Extractor} -- in our case, \textit{openpose\_ros} and \textit{pose\_3d\_ros}, an extra person detection and tracking module is not a must. Figure \ref{fig:single_pipe} shows a trivial pipeline for single person.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PipeArch/single_pipe.png}
+  \caption{A trivial pipeline for single person}
+  \label{fig:single_pipe}
+\end{figure}
+
+However, when it comes to multi-person scenario, every detected person, as shown in Figure \ref{fig:det_demo}, should be tracked, shown in Figure \ref{fig:track_demo}, thus extracting an unique ID for each person. Then based on the boundingbox of each person after tracking, a cropped image of each person will be fed into the pose estimation model. \textit{Data Manager} will create a pose pool to keep a track of the pose data for all the people detected and tracked, and preprocess the pose data of each person respectively. Figure \ref{fig:action_demo} displays the final action classification results of each person in the scene. In our pipeline, we consider multi-person as default scenario, as a result, the trivial pipeline for single person is integrated in our final pipeline.  
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PipeArch/det_demo.png}
+  \caption{\textbf{A detection demo scenario.} We utilize YOLO3 \cite{yolov3} as our detector and  
+           filter out all the detected persons with a confidence of less than 80\%}
+  \label{fig:det_demo}
+\end{figure}
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PipeArch/track_demo.png}
+  \caption{\textbf{A tracking demo scenario.} Taking the detection list as input, our tracker will
+           track each person appeared in the scene and assign each of them an unique person ID.}
+  \label{fig:track_demo}
+\end{figure}
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PipeArch/action_demo.png}
+  \caption{\textbf{An action demo scenario.} Our pose estimator will extract pose data for each person
+           based on the cropped image, and then \textit{data\_manager} generates pose tensor and at 
+           last, action classifier will do the action prediction (in the example, walking or standing),
+           taking the pose tensor as input.}
+  \label{fig:action_demo}
+\end{figure}
+
+%% Introduction to individual module 
+\section{Module Functionality}
+As described above, different modules serve as different roles in the pipeline, in the following more details of each component will be discussed.
+
+% ----------------------
+\subsection{Message Repository}
+\label{pipeline:MR}
+Before we go deeper into the modules, we should first introduce the messages involved in the pipeline. To manage all the ros custom messages, services as well as actions, a ros package named message\_repository is created. Three messages are currently used: \texttt{FrameInfo.msg}, \texttt{Person.msg} and \texttt{BoundingBox.msg}. Their definitions are listed below:\\
+
+\texttt{FrameInfo.msg}
+\begin{table}[H]
+\begin{tabular}{|l|l}
+\cline{1-1}
+\begin{tabular}[c]{@{}l@{}}\texttt{\# Message defining frame information}\\ \\ 
+\texttt{uint32} \hspace*{6em} \texttt{frame\_id} \hspace*{2em} \texttt{\# ID of current frame} \\ 
+\texttt{sensor\_msgs/Image} \hspace*{0.3mm} \texttt{image\_frame} \hspace*{0.5em} \texttt{\# Current RGB image frame} \\ 
+\texttt{Person{[}{]}} \hspace*{5em} \texttt{persons} \hspace*{2.5em} \texttt{\# All persons detected/tracked in the current frame}\\ 
+\texttt{bool} \hspace*{7em} \texttt{last\_frame} \hspace*{1em} \texttt{\# signal for last frame at testing}\end{tabular} & \\ \cline{1-1}
+\end{tabular}
+\end{table}
+
+The detection info and tracking info message are actually of type \texttt{FrameInfo}, which contains the the current image and its frame number, a list of detected or tracked persons in the image frame and an extra \texttt{last\_frame} flag for signaling the end of a video or image sequence at testing and evaluation stage. \\
+
+\texttt{Person.msg}
+\begin{table}[H]
+\begin{tabular}{|lllll|}
+\hline
+\multicolumn{5}{|l|}{\texttt{\# Message defining person information}} \\
+\multicolumn{5}{|l|}{}                                                                       \\
+\texttt{uint32}            &  & \texttt{frame\_id} &  & \texttt{\# current frame number}     \\
+\texttt{uint32}                     &  & \texttt{person\_id} &  & \texttt{\# unique identity of the person} \\
+\texttt{BoundingBox}                &  & \texttt{bbox} &  & \texttt{\# (x\_left, y\_top, width, height)} \\
+\texttt{float64}                    &  & \texttt{confidence} &  & \texttt{\# confidence of detection/tracking} \\
+\texttt{geometry\_msgs/Point{[}{]}} &  & \texttt{person\_pose}   &  & \texttt{\# pose keypoints of a person in a frame} \\
+\texttt{sensor\_msgs/Image}         &  & \texttt{pose\_tensor}   &  & \texttt{\# pose tensor for action prediction} \\
+\texttt{string}                     &  & \texttt{person\_action} &  & \texttt{\# predicted action label} \\ \hline
+\end{tabular}
+\end{table}
+
+The \texttt{Person} message includes all the required person information along the pipeline. Actually, different modules are responsible for the different information in the \texttt{Person} message: \textit{Source Provider} offers the input of the whole pipeline, which is an RGB image message, and it conveys the information of \texttt{frame\_id}. Then \textit{Person Detector} extracts \texttt{bounding box} of person and the corresponding \texttt{confidence}. After that, \textit{Person Tracker} keeps a track of each person and assigns \texttt{person\_id} to them. The role of \textit{Feature Extractor} is to get the \texttt{person\_pose} with the help of some deep learning models. \textit{Data Manager} serves as data processing, which generates \texttt{pose\_tensor} for specific person. At last, \textit{Action Classifier} predicts the \texttt{person\_action} based on the \texttt{pose\_tensor} from \textit{Data Manager}. \\ \newpage
+
+\texttt{BoundingBox.msg}
+\begin{table}[H]
+\begin{tabular}{|lllll|}
+\hline
+\multicolumn{5}{|l|}{\texttt{\# Message defining person bounding box}} \\
+\multicolumn{5}{|l|}{}                                        \\
+\texttt{float64}   &   & \texttt{left}    &   & \texttt{\# left position of the person}  \\
+\texttt{float64}   &   & \texttt{top}     &   & \texttt{\# top position of the person}   \\
+\texttt{float64}   &   & \texttt{width}   &   & \texttt{\# width of the bbox}            \\
+\texttt{float64}   &   & \texttt{height}  &   & \texttt{\# height of the bbox}           \\ \hline
+\end{tabular}
+\end{table}
+
+The \texttt{BoundingBox} message plays an auxiliary role for storing the bounding box information extracted by \textit{Person Detector}, with the pattern of \texttt{(x\_{min}, y\_{min}, bbox\_width, bbox\_height)}, where \texttt{x} and \texttt{y} are the coordinates in the image. 
+
+
+% ----------------------
+% source provider module
+\subsection{Source Provider}
+\label{pipeline:SP}
+As input of the whole pipeline, \textit{Source Provider} offers two available sources, one for online video stream (using \texttt{cv\_camera} package), the other for offline image sequence (using \texttt{image\_reader} package). \\
+
+% cv_camera package
+\subsubsection{Cv\_camera Package} 
+
+The \texttt{cv\_camera} package\footnote{\url{https://github.com/jiangyonghui/cv_camera}} includes a ROS OpenCV camera driver, which takes advantage of cv::VideoCapture of OpenCV\footnote{\url{https://docs.opencv.org/3.1.0/d8/dfe/classcv_1_1VideoCapture.html}} and interacts with hardware devices (e.g. webcam, video camera) and video files. It contains two nodes: \texttt{cv\_camera\_node} and its \texttt{Nodelet}\footnote{\url{http://wiki.ros.org/cv_camera}}. Figure \ref{fig:cv_camera_topics} shows the computation graph of \texttt{cv\_camera} node.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.5\linewidth]{PipelineDesign/SourceProvider/cv_camera.png}
+  \caption{ROS Topics and Messages in \texttt{cv\_camera} node}
+  \label{fig:cv_camera_topics}
+\end{figure}
+
+\textbf{APIs Summary}
+
+ROS node: \texttt{cv\_camera\_node}
+
+\begin{itemize}
+\item[•] Publisher \\
+Topic: \texttt{/cv\_camera/image\_raw} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: RGB image message 
+
+\item[•] Main Parameters \\
+\texttt{$\sim$rate}: publish rate, default: 30.0 \\
+\texttt{$\sim$device\_id}: capture device id, default: 0 \\
+\texttt{$\sim$image\_width}: set capture image width \\
+\texttt{$\sim$image\_height}: set capture image height \\
+\texttt{$\sim$file}: set to use video file instead of device \\
+
+\item[•] Main Flags \\
+\texttt{---wait\_for\_subscriber}: if true, cv\_camera\_node will start working until at least one subscriber is set to topic \texttt{/cv\_camera/image\_raw}, default: false
+\end{itemize}
+
+\subsubsection{Image\_reader Package}
+
+Similar to \texttt{cv\_camera}, \texttt{image\_reader} package provides a ros node, which reads image sequences from local folders or server and publish image message at a certain frequency, as shown in Figure \ref{fig:image_reader_topics}.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.5\linewidth]{PipelineDesign/SourceProvider/image_reader.png}
+  \caption{ROS Topics and Messages in \texttt{image\_reader} node}
+  \label{fig:image_reader_topics}
+\end{figure}
+
+\textbf{APIs Summary}
+
+\begin{itemize}
+\item[•] Publisher \\
+Topic: \texttt{/image\_reader/image\_raw} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: RGB image message 
+
+\item[•] Parameters \\
+\texttt{$\sim$image\_path}: full path to image folder \\
+\texttt{$\sim$rate}: publish rate, default: 30.0 
+
+\item[•] Flags \\
+\texttt{---display\_image}: set true to show the published image \\
+\end{itemize}
+
+
+% ----------------------
+% person detector module
+\subsection{Person Detector}
+\label{pipeline:PD}
+The first step after input is to detect persons in the image frame. In this module, we wrap YOLO darknet\footnote{\url{https://gitlab.com/EAVISE/darknet}} C++ API into the ROS node and take advantage of pretrained model\footnote{\url{https://pjreddie.com/darknet/yolo/}}.
+
+\subsubsection{YOLO Darknet}
+As described in Section \ref{related_work:pd}, the YOLO network \cite{DBLP:journals/corr/RedmonDGF15} divides the image into regions and predicts bounding boxes and probabilities for each region. These bounding boxes are weighted by the predicted probabilities. A detection example is shown in Figure \ref{fig:yolo_demo}. 
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.4\linewidth]{PipelineDesign/PersonDetector/yolo_demo.png}
+  \caption{A YOLO detection example.}
+  \label{fig:yolo_demo}
+\end{figure}
+
+Based on the runtime performance as shown in Figure \ref{fig:yolo_benchmark}, we utilize the pretrained model YOLOv3-320\footnote{\url{https://pjreddie.com/darknet/yolo/}}, which achieves real-time in our final testing with 35 ~ 40fps (frame per second). 
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.5\linewidth]{PipelineDesign/PersonDetector/yolo_benchmark.png}
+  \caption{YOLOv3 runs significantly faster than other detection methods with comparable performance.
+           Times from either an M40 or Titan X, they are basically the same GPU. 
+           \cite{DBLP:journals/corr/RedmonDGF15}}
+  \label{fig:yolo_benchmark}
+\end{figure}
+
+\subsubsection{Person\_detector Package}
+In this module we create one ROS package -- \texttt{person\_detector}, which includes one ros node. Figure \ref{fig:pd} shows the computation graph of \texttt{person\_detector} node.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PersonDetector/pd.png}
+  \caption{ROS Topics and Messages in \texttt{person\_detector} node}
+  \label{fig:pd}
+\end{figure} 
+
+\textbf{Implementation Details}
+
+In the implementation, since we haven't retrained the yolo model specifically for person, an object filter is applied to only get the bounding boxes of persons, at the same time, a threshold confidence for detection is set to leave out the less potential agents in the detection list. Figure \ref{fig:det_unfiltered} shows an example of detecion without thresholding detection confidence, while Figure \ref{fig:det_demo} displays the filtered detection result. 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PersonDetector/det_unfiltered.png}
+  \caption{\textbf{A detection demo scenario without thresholding detection confidence.} Before
+           thresholding the confidence, some random detection appears in the detecion list.}
+  \label{fig:det_unfiltered}
+\end{figure}
+
+While this person detector also comes with some problems. Somehow the wrong object would be taken as person while the true human agents are left out of the detection list. As illustrated in Figure \ref{fig:wrong_det}, the detected object in yellow is not a person, though it is label as one, while some other persons in the scene are not detected.  
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/PersonDetector/wrong_det.png}
+  \caption{A scene of both positive false and negative false case from the YOLO person detector} 
+  \label{fig:wrong_det}
+\end{figure}
+
+In terms of ROS, the input image message is of type \texttt{sensor\_msgs/Image}, which will be converted to OpenCV image format (\texttt{cv::Mat} or \texttt{cv2.image}) via another ROS package --- \texttt{cv\_bridge}\footnote{\url{http://wiki.ros.org/cv_bridge}}. As shown in Figure \ref{fig:cv_bridge}, the \texttt{cv\_bridge} package serves as the bridge between ROS image message and OpenCV image, offering the APIs for the convertion in both C++\footnote{\url{http://wiki.ros.org/cv_bridge/Tutorials/UsingCvBridgeToConvertBetweenROSImagesAndOpenCVImages}} and Python\footnote{\url{
+http://wiki.ros.org/cv_bridge/Tutorials/ConvertingBetweenROSImagesAndOpenCVImagesPython}}. 
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.3\linewidth]{PipelineDesign/PersonDetector/cv_bridge.png}
+  \caption{\textbf{CvBrideg}: Convertion between ROS image messages and OpenCV images. \cite{roscvbridge}}
+  \label{fig:cv_bridge}
+\end{figure}
+
+\textbf{APIs Summary}
+
+\begin{itemize}
+\item[•] Subscriber \\
+Topic: \texttt{cv\_camera/image\_raw}; \texttt{image\_reader/image\_raw} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: RGB image message
+
+\item[•] Publisher \\
+Topic: \texttt{/person\_detector/detection\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: detection list of persons with frame ID, image frame, person bounding box and detection confidence \\
+\texttt{--------} \\
+Topic: \texttt{/person\_detector/det\_render\_image} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: detection image rendered with person bounding box and confidence 
+
+\item[•] Main Parameters \\
+\texttt{$\sim$image\_topic}: set image topic for image subscriber
+\texttt{$\sim$model\_cfg}: network configuration, default: \texttt{"yolov3.cfg"} \\ 
+\texttt{$\sim$model\_weights}: network weights, default: \texttt{"yolo3.weights"} \\
+\texttt{$\sim$thres\_conf}: confidence threshold for filtering detected persons, default: 0.8
+
+\item[•] Main Flags \\
+\texttt{---visual\_detection}: set ture to display images rendered with person bounding box \\
+\texttt{---write\_video}: set true to write detection video \\
+\texttt{---write\_det\_file}: set true to write detection list to file \\
+\end{itemize}
+
+% ------------------------------------------%
+% person tracker module
+\subsection{Person Tracker}
+\label{pipeline:PT}
+Based on the detection list from \textit{Person Detector}, \textit{Person Tracker} is supposed to extract the IDs for each person that has appeared in the scene and keep a track of them. 
+
+\subsubsection{Person Tracker Framework}
+
+Our tracker utilizes the basic framework similar to \cite{adam2006}. As described, let $(x_{0}, y_{0})$ be the person position estimation from the previous frame (for the first frame, it is the position from detection result), and let $r$ be our search radius. Let $P_{T} = (dx, dy, h, w)$ be an arbitrarily chosen rectangular patch in the template, whose center is displaced $(dx, dy)$ from the template center, and whose half width and height are $w$ and $h$ respectively. Let $(x, y)$ be a hypothesis on the person’s position in the current frame. Then the patch $P_{T}$ defines a corresponding rectangular patch in the image $P_{I;}(x,y)$ whose center is at $(x + dx, y + dy)$ and whose half width and height are $w$ and $h$. Figure \ref{fig:patch_matching} describes this correspondence.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.45\linewidth]{PipelineDesign/PersonTracker/patch_matching.png}
+  \caption{Template patch $P_{T}$ and the corresponding image patch $P_{I;}(x,y)$ for a hypothesized
+           position $(x, y)$. \cite{adam2006}}
+  \label{fig:patch_matching}
+\end{figure} 
+
+Given the patch $P_{T}$ and the corresponding image patch $P_{I;}(x,y)$, the similarity between the patches is an indication of the validity of the hypothesis that the object is indeed located at $(x, y)$. If $d(Q, P)$ is some measure of similarity between patch $Q$ and patch $P$ , then we define 
+\begin{equation}
+V_{P_{T}}(x,y) = d(P_{I;}(x,y), P_{T})
+\end{equation}
+
+When $(x, y)$ runs on the range of hypotheses, we get $V_{P_{T}}(·,·)$, which is the vote map corresponding to the template patch $P_{T}$. We measure similarity between patches by comparing various features (e.g. FHOG \cite{Felz2010}) extracted from them. After that, the vote maps obtained from all template patches will be combined to get the current person position, which obtained the minimal sum (vote maps actually measure dissimilarity between patches). While this approach has a drawback that an occlusion affecting even a single patch may contribute a high value to the sum at the correct position, resulting in a wrong estimate. Instead, a a LMedS-type estimator proposed in \cite{adam2006} will be used to achieve a robust tracking result. 
+
+\subsubsection{Person\_tracker Package} 
+
+In \textit{Person Tracker} module we create one ROS package: \texttt{person\_tracker}, which comes with one ROS node. Figure \ref{fig:pt_node} displays the computation graph of \texttt{person\_tracker} node.
+Figure \ref{fig:track_demo} shows an example of tracking based on detection.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\linewidth]{PipelineDesign/PersonTracker/pt_node.png}
+  \caption{ROS Topics and Messages in \texttt{person\_tracker} node}
+  \label{fig:pt_node}
+\end{figure} 
+
+\textbf{Implementation Details}
+
+In the implementation, some problems will often occur, which could be partly solved by tuning some parameters described below. The first problem is, when two agents have an intersection, one person's bounding box will be brought away by the other. As shown in Figure \ref{fig:person_intersec}, after intersection between person 2 and 3, the bounding box of person 2 drifted away. A similar situation happens in Figure \ref{fig:bbox_lag}, where the bounding box of person 7 didn't follow the person.
+After several attempts, we extend the threshold for tracking termination and set ratios both for false negative and false positive to 0.1, as shown in Figure \ref{fig:person_intersec_mod}, after intersection, the bounding box of person 2 is still at a reasonable location.
+
+\begin{figure}[H]
+  \centering
+  \subfigure[Befor intersection.]{
+  \includegraphics[width=0.32\linewidth]{PipelineDesign/PersonTracker/pre_intersec.png}}  
+  \subfigure[After intersection]{
+  \includegraphics[width=0.32\linewidth]{PipelineDesign/PersonTracker/post_intersec.png}}
+  \caption{Demo scenario for person intersection}
+  \label{fig:person_intersec}
+\end{figure} 
+
+\begin{figure}[H]
+  \centering
+  \subfigure[Modified: befor intersection]{
+  \includegraphics[width=0.3\linewidth]{PipelineDesign/PersonTracker/bbox_lag_pre.png}}  
+  \subfigure[Modified: after intersection]{
+  \includegraphics[width=0.3\linewidth]{PipelineDesign/PersonTracker/bbox_lag_post.png}}
+  \caption{Demo scenario for person bounding box lagging}
+  \label{fig:bbox_lag}
+\end{figure} 
+
+\begin{figure}[H]
+  \centering
+  \subfigure[Modified: befor intersection]{
+  \includegraphics[width=0.30\linewidth]{PipelineDesign/PersonTracker/pre_intersec_mod.png}}  
+  \subfigure[Modified: after intersection]{
+  \includegraphics[width=0.30\linewidth]{PipelineDesign/PersonTracker/post_intersec_mod.png}}
+  \caption{Demo scenario for person intersection after modification}
+  \label{fig:person_intersec_mod}
+\end{figure} 
+
+The second problem happens when it comes to the boundary. As shown in Figure \ref{fig:boundary_check}, after the person disappeared in the scene, an invalid bounding box still appeared. Then we add a boundary check to the framework, which checks if the bounding box has already intersected with the boundary, if so, the tracking of that person is terminated. 
+
+\begin{figure}[H]
+  \centering
+  \subfigure[Before intersection with boundary]{
+  \includegraphics[width=0.30\linewidth]{PipelineDesign/PersonTracker/bound_check_pre.png}}  
+  \subfigure[After intersection with boundary]{
+  \includegraphics[width=0.30\linewidth]{PipelineDesign/PersonTracker/bound_check_post.png}}
+  \caption{Demo scenario for boundary check befores modification}
+  \label{fig:boundary_check}
+\end{figure} 
+
+\begin{figure}[H]
+  \centering
+  \subfigure[Modified: before intersection with boundary]{
+  \includegraphics[width=0.30\linewidth]{PipelineDesign/PersonTracker/bound_check_pre_mod.png}}  
+  \subfigure[Modified: after intersection with boundary]{
+  \includegraphics[width=0.31\linewidth]{PipelineDesign/PersonTracker/bound_check_post_mod.png}}
+  \caption{Demo scenario for boundary check after modification}
+  \label{fig:boundary_check_mod}
+\end{figure} 
+
+\textbf{APIs Summary}
+
+\begin{itemize}
+\item[•] Subscriber \\
+Topic: \texttt{/person\_detector/detection\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: detection list of persons with frame ID, image frame, person bounding box and detection confidence  
+
+\item[•] Publisher \\
+Topic: \texttt{/person\_tracker/tracking\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: tracking list of persons with frame ID, image frame, person bounding box, person ID and tracking confidence \\
+\texttt{--------} \\
+Topic: \texttt{/person\_tracker/track\_render\_image} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: tracking image message rendered with person ID, bounding box and tracking confidence 
+
+\item[•] Main Paramsters \\
+\texttt{$\sim$detection\_topic}: set topic for detection info subscriber \\
+\texttt{$\sim$sotracker\_type}: specify the single-object-tracker type, default: \texttt{"fragment tracker"} \\
+\texttt{$\sim$feature\_type}: specify feature type, default: \texttt{"FHOG"}
+
+\item[•] Main Flags \\
+\texttt{---visual\_tracking}: set ture to display image rendered with tracking bounding box and person ID \\
+\texttt{---write\_video}: set true to write out video with tracking image \\
+\texttt{---write\_track\_file}: set true to write tracking list to file
+\end{itemize}
+
+% ------------------------------------------%
+% feature extractor module
+\subsection{Feature Extractor}
+\label{pipeline:FE}
+Now we have obtained a list of persons with unique IDs. The next step is to extract the pose data based on the cropped image of each person. Since this thesis focuses on human pose, the \textit{Feature Extractor} module equals \textit{Pose Estimator}. While for future development, other features can also be extracted and integrated into the pipeline. In this module, two ROS packages are created for pose estimation: \texttt{openpose\_ros} package and \texttt{pose\_3d\_ros} package. 
+
+\subsubsection{OpenPose Library}
+
+This package is built upon the open source library --- \textit{OpenPose}\footnote{\label{git:openpose}\url{https://github.com/CMU-Perceptual-Computing-Lab/openpose}} by Carnegie Mellon University, which is based on the works \cite{cao2017realtime, DBLP:journals/corr/SimonJMS17, journals/corr/WeiRKS16}. \textit{OpenPose} represents the first real-time multi-person system to jointly detect human body, hand, facial, and foot keypoints (in total 135 keypoints) on single images using OpenCV\footnote{\url{https://opencv.org/}} and Caffe\footnote{\url{http://caffe.berkeleyvision.org/}} (also available in other frameworks, e.g. Tensorflow\footnote{\url{https://www.tensorflow.org/}} and Torch\footnote{\url{http://torch.ch/}}). An effect demonstration of \textit{OpenPose} is displayed in Figure \ref{fig:openpose_demo}. 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.7\linewidth]{PipelineDesign/FeatureExtractor/openpose_demo.png}
+  \caption{A demo of \textit{OpenPose\footref{git:openpose}}.}
+  \label{fig:openpose_demo}
+\end{figure} 
+
+
+In our pipeline, we utilize the its pretrained 2D COCO body model (18 body parts), with the annotation and body joints shown in Figure \ref{fig:coco_model}, while figure \ref{fig:pose_data} shows an example of estimated pose data, which is an array with the format $[ ... , x_{i}, y_{i}, confidence_{i}, ... , ]$ of size 54 $(= 18 \times 3)$.
+
+\begin{figure}[h!]
+  \centering
+  \subfigure[COCO body joints ordering.]{
+  \includegraphics[width=0.3\linewidth]{PipelineDesign/FeatureExtractor/coco_model.png}
+  \label{subfig:coco_body_joints}}  
+  \subfigure[COCO body parts map]{
+  \includegraphics[width=0.3\linewidth]{PipelineDesign/FeatureExtractor/coco_body.png}
+  \label{subfig:coco_body_map}}
+  \caption{COCO body model.}
+  \label{fig:coco_model}
+\end{figure} 
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.55\linewidth]{PipelineDesign/FeatureExtractor/pose_data.png}
+  \caption{An example of pose data output}
+  \label{fig:pose_data}
+\end{figure} 
+
+\subsubsection{Openpose\_ros Package}
+
+This package contains one ROS node --- \texttt{openpose\_ros}. The computation graph of \texttt{openpose\_ros} node is shown in Figure \ref{fig:openpose_ros}. 
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/FeatureExtractor/openpose_ros.png}
+  \caption{ROS Topics and Messages of \texttt{openpose\_ros} node}
+  \label{fig:openpose_ros}
+\end{figure}  
+
+\textbf{Implementation Details}
+
+We first convert the image message contained in the frame info message from \texttt{/person\_tracker} to OpenCV image, then based on person bounding box, we get the cropped images of each person. After that the cropped images will be fed into the Caffe model to get the estimated pose data for each person detected in the scene. Here we can either publish single person message (\texttt{message\_repository/Person}) once each of them has done pose estimation or push them back in the frame info message (\texttt{message\_repository/FrameInfo}) and send them all at once. For the transporting of pose data, we utilize \texttt{/geometry\_msgs/Point} as its message type, which has the data structure listed below:
+
+\begin{table}[H]
+\begin{tabular}{|lll|}
+\hline
+\multicolumn{3}{|l|}{\texttt{\# This contains the position of a point in free space}} \\
+                             &                       &                       \\
+\texttt{float64}             &                       & \texttt{x}            \\
+\texttt{float64}             &                       & \texttt{y}            \\
+\texttt{float64}             &                       & \texttt{z}            \\ \hline
+\end{tabular}
+\end{table} 
+
+Where $x$ holdes the value of joint $x$ coordinate, $y$ holds the value of joint $y$ coordinate, while $z$ holds the value of joint confidence (in the case of 3D pose, $z$ corresponds to the depth of the joint). 
+
+\textbf{APIs Summary}
+
+\begin{itemize}
+\item[•] Subscriber \\
+Topic: \texttt{/person\_tracker/tracking\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: tracking list of persons with frame ID, image frame, person bounding box, person ID and tracking confidence
+
+\item[•] Publisher \\
+Topic: \texttt{/openpose\_ros/skeleton\_image} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: skeleton-rendered image message \\
+\texttt{--------} \\
+Topic: \texttt{/openpose\_ros/frame\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: frame info with frame ID, image frame, person ID, bounding box, pose keypoints and confidence \\
+\texttt{--------} \\
+Topic: \texttt{/openpose\_ros/person} \\
+Message type: \texttt{message\_repository/Person} \\
+Message: single person message with frame ID, person ID, bounding box, pose keypoints and confidence
+
+\item[•] Main Parameters \\
+\texttt{$\sim$tracking\_info\_topic}: set topic for tracking list subscription \\
+\texttt{$\sim$pose\_model}: body model to be used, default: \texttt{"COCO"}
+
+\item[•] Main Flags \\ 
+\texttt{---publish\_person}: set true to publish single person message \\
+\texttt{---visual\_skeleton}: set true to display skeleton-rendered image \\
+\texttt{---save\_keypoints}: set true to save keypoints in json format \\
+\texttt{---save\_skeleton\_image}: set ture to save skeleton image \\
+\texttt{---write\_video}: set true to write video with skeleton-rendered image 
+\end{itemize}
+
+
+\subsubsection{Stacked Hourglass Network}
+
+Another package in this module is a 3D pose estimator, which is based on the framework from \cite{DBLP:journals/corr/ZhouH0XW17}. As mentioned in Section \ref{subsec:pose_based_ar}, the architecture of the framework consists of a 2D pose estimation module which is imported from
+the state-of-art hourglass architecture (shown in Figure \ref{fig:stacked_hourglass_model}) in \cite{DBLP:conf/eccv/NewellYD16} and a depth regression module. 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.7\linewidth]{PipelineDesign/FeatureExtractor/stacked_hourglass_model.png}
+  \caption{Stacked hourglass network for pose estimation consists of multiple stacked hourglass modules
+           which allow for repeated bottom-up, top-down inference. \cite{DBLP:conf/eccv/NewellYD16}}
+  \label{fig:stacked_hourglass_model}
+\end{figure}  
+
+\subsubsection{Pose\_3d\_ros Package}
+
+Similar to \texttt{/openpose\_ros}, \texttt{/pose\_3d\_ros} package has one node. Figure \ref{fig:pose_3d_ros} illustrates the computation graph of \texttt{pose\_3d\_ros} node.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/FeatureExtractor/pose_3d_ros.png}
+  \caption{ROS Topics and Messages of \texttt{pose\_3d\_ros} node}
+  \label{fig:pose_3d_ros}
+\end{figure} 
+
+\textbf{Implementation Details}
+
+We utilized the PyTorch implementation of this approach with the pretrained model from the GitHub repository of the author\footnote{\url{https://github.com/xingyizhou/pytorch-pose-hg-3d}}. The network takes a subject-centered RGB image which is further resized and zero-padded to a $256 \times 256$ patch as input and returns a $16 \times 3$ matrix that contains the 3D coordinates of the 16 body joints. The pose estimation result $\hat{\mathbf{P}_{3D}} \in \mathbf{R}^{J\times 3}$ of $J$ body joints is composed of the 2D joints $\hat{\mathbf{P}_{2D}} \in \mathbf{R}^{J\times 2}$ (peak locations on the heat maps) and the depth values $\hat{\mathbf{P}_{dep}} \in \mathbf{R}^{J\times 1}$ in corresponding scales. A sample visualization of the estimated pose of a subject sitting in the chair is displayed in Figure \ref{fig:3d_demo} and configuration of body joints is shown in Figure \ref{fig:3d_body_map}.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.85\linewidth]{PipelineDesign/FeatureExtractor/3d_demo.png}
+  \caption{A visualization of the estimated 3D pose of a sitting subject from the NTU RGB+D dataset
+           \cite{DBLP:journals/corr/ShahroudyLNW16}. The image displayed is resized and zero-padded to
+           a $256 \times 256$ patch. The 2D component of the original estimated pose $\hat{\mathbf{P}
+           _{2D}}$ is represented in the corresponding coordinate system of $[0, 256] \times [0, 256]$
+           and the depth value $\hat{\mathbf{P}_{dep}}$ is estimated in corresponding scale. Therefore,
+           $\hat{\mathbf{P}_{3D}}$ is a “pseudo” 3D skeletal representation in a “3D image coordinate
+           system”.}
+  \label{fig:3d_demo}
+\end{figure} 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.35\linewidth]{PipelineDesign/FeatureExtractor/3d_body_map.png}
+  \caption{Configuration of 16 body joints in the 3D pose estimator proposed by 
+           \cite{DBLP:journals/corr/ZhouH0XW17}. The labels of the 16 joints are: 1-right ankle, 
+           2-right knee, 3-right hip, 4-left hip, 5-left knee, 6-left ankle, 7-spline base, 
+           8-middle of spine, 9-neck, 10-head, 11-right hand, 12-right elbow, 13-right shoulder, 
+           14-left shoulder, 15-left elbow, 16-left hand.}
+  \label{fig:3d_body_map}
+\end{figure} 
+
+Since this 3D pose estimator works only for single person, we still feed the cropped image of each person into the PyTorch model and get the pose data, which is a numpy array\footnote{\url{https://docs.scipy.org/doc/numpy-1.15.1/reference/generated/numpy.array.html}} of shape $(16, 3)$. Then we either publish the single person message together with the \texttt{frame\_id}, \texttt{person\_id}, \texttt{image\_frame}, \texttt{bbox} as well as \texttt{person\_pose} or put them in one frame info message and publish them all at once. 
+
+\textbf{APIs Summary}
+
+\begin{itemize}
+\item[•] Subscriber \\
+Topic: \texttt{/person\_tracker/tracking\_info} \\
+Message type: \texttt{message\_repository/FrameInfo}
+Message: tracking list of persons with frame ID, image frame, person bounding box, person ID and tracking confidence
+
+\item[•] Publisher \\
+Topic: \texttt{/pose\_3d\_ros/skeleton\_image} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: skeleton-rendered image message \\
+\texttt{--------} \\
+Topic: \texttt{/pose\_3d\_ros/frame\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: frame info with frame ID, image frame, person ID, bounding box, pose keypoints and confidence \\
+\texttt{--------} \\
+Topic: \texttt{/pose\_3d\_ros/person} \\
+Message type: \texttt{message\_repository/Person}
+Message: single person message with frame ID, person ID, bounding box, pose keypoints and confidence
+
+\item[•] Main Parameters \\
+\texttt{$\sim$tracking\_info\_topic}: set topic for tracking list subscription \\
+\texttt{$\sim$pose\_model}: body model to be used
+
+\item[•] Main Flags \\
+\texttt{---publish\_person}: set true to publish single person message \\
+\texttt{---save\_keypoints}: set true to save keypoints \\
+\texttt{---save\_skeleton\_image}: set ture to save skeleton image
+\end{itemize}
+
+% ------------------------------------------%
+% data manager module
+\subsection{Data Manager}
+\label{pipeline:DM}
+After pose estimation, \textit{Data Manager} takes the responsibility to process data (e.g. interpolation, smoothing, normalization, etc.), so as to prepare the pose tensor for \textit{Action Classifier}. 
+
+\subsubsection{Formation of Pose Tensor}
+
+In order to classify a video sequence to an action category, a convolutional neural network (PoseNet, see Section \ref{pipeline:AP}) is utilized to learn the spatio-temporal features of 2D/3D poses from the entire sequence. The spatial information is the skeletal structure of body joints that intuitively represents a human posture in one video frame. The temporal information is the dynamics of human postures contained in the trajectory of body joints in an action sequence. For the data-driven learning based on convolutional kernels instead of recurrent networks, it is essential that both the spatial structure of body joints and the temporal evolution of skeletons are encoded in a compact manner. Accordingly, the pose tensor is formed in a compact structure with 2D/3D skeletal information of an action sequence. The topological ordering and three-channel-structure of pose tensor are introduced in the following.
+
+\textbf{Topological Ordering}
+
+Following the work of \cite{DBLP:journals/corr/LiuSXW16}, a tree-structured traversal is designed to define a topological ordering of the human body joints. As is illustrated in Figure \ref{fig:pose_topo}, a cyclic path is constructed by a traversal with repetition along the tree structure. Starting from the root node of joint \textit{spine base} (joint 7), the path goes forward until a leaf node is reached and then moves backward back to the nearest node with at least two children. The forward and backward pass are conducted repeatedly in this manner until every leaf node in the tree is reached. In this case, every limb (or edge in the tree structure) is passed exactly twice, once in the forward pass from parent to child and once backward from child to parent. The $j$th joint (a node in the tree structure) that connects $n_{j}$ limbs is visited exactly $n_{j}$ times in this cyclic path, except for joint 7 (the root node) that is visited $n_{7} + 1$ times. For example, the five external joints 10, 11, 16, 1, 6 (\textit{head, right hand, left hand, right ankle, left ankle}) are visited only once. The internal joints such as 12, 15 (\textit{right elbow, left elbow}) that connect two body limbs are visited two times. The important junction 9 (\textit{neck}) that connects four body limbs is visited four times. In this way, neighborhood information in the body configuration is preserved, as a body joint always appears with its adjacencies in the node sequence yielded by this topological ordering \cite{lin2018}.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/FeatureExtractor/pose_topo.png}
+  \caption{(a) The body configuration of 15 joints (joint 8 is omitted). (b) The full body is unfolded
+           into a tree structure, with joint 7 (\textit{spine base}) as the root node (c) The
+           topological ordering is defined by a cyclic path along the tree structure. Each limb is
+           visited twice in the bidirectional traverse with repetition and each joint always appears
+           with its neighbors in the sequence. The generated node sequence is 7-3-2-1-2-3-7-4-5-6-5-
+           4-7-9-10-9-13-12-11-12-13-9-14-15-16-15-14-9-7. \cite{lin2018}}
+  \label{fig:pose_topo}
+\end{figure} 
+
+Similar to \cite{DBLP:journals/corr/Baradel0M17}, the first channel of pose tensor is constructed by arranging the 3D coordinates of body joints from all video frames in a compact manner, as is shown in
+Figure \ref{fig:3_channel_struct}. We first concatenate 3D coordinates $x$, $y$ and $z$ of joints from one frame as a row vector in the topological ordering designed above. Then the 3D coordinates from different frames in an action sequence are stacked row-wisely. We denote the length of the node sequence of topological ordering as $L$ and the number of frames in an sequence as $T$.
+
+After the concatenation and row-wise stacking, we end up with a 2D matrix $\mathbf{X} \in \mathbf{R}^{T \times 3L}$. In order to deal with videos of varying length of frames, the skeleton data matrix \textbf{X} is regarded as an image and its first dimension is normalized to a fixed value \textit{K} by a basic image resizing operation with bi-cubic interpolation. We acquire the normalized matrix of
+skeleton data $\tilde{\mathbf{X}} \in \mathbf{R}^{K \times 3L}$. We set \textit{K} = 10.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.75\linewidth]{PipelineDesign/FeatureExtractor/3_channel_struct.png}
+  \caption{The 3D pose tensor $\mathbf{T} \in \mathbf{R}^{K \times 3L \times 3}$: the first dimension
+           is the frame index, the second dimension is the $x$, $y$ and $z$ coordinates of all the body 
+           joints concatenated in the topological ordering designed in Figure \ref{fig:pose_topo}, 
+           the third dimension contains raw coordinates, velocities, accelerations as the three 
+           channels. \cite{lin2018}}
+  \label{fig:3_channel_struct}
+\end{figure} 
+
+\textbf{Three-Channel-Structure}
+
+As illustrated in Figure \ref{fig:3_channel_struct}, the normalized $K$-frame matrix of raw 3D coordinates of joints $\tilde{\mathbf{X}}$ constitutes the first channel of the 3D pose tensor. The temporal evolution of pose is regarded as a continuous and differentiable function of body joints over time. Additional kinematic features can be added by computing the derivatives of joint positions. Accordingly, the second channel is composed by the first derivatives of the 3D coordinates, which
+represent the velocities of body joints between two consecutive frames. The third channel consists of the second derivatives, which describe the acceleration of body joints. In order to recover the actual velocity and acceleration in the original action sequence of $T$ frames. We compute the temporal step $s$ between two frames in the resized $K$-frame matrix by
+
+\begin{equation}
+s = floor(\frac{T}{K})
+\end{equation}
+
+Then we denote the $x$-component of the raw 3D coordinates, its first derivative and the second derivative of the $j$th joint in the $k$th frame as $x_{k,j}$ , $\dot{x}_{k,j}$ and $\ddot{x}_{k,j}$. The derivatives can be derived by
+
+\begin{equation}
+\dot{x}_{k,j} = \left\{\begin{matrix} 0, & k = 1\\ \frac{x_{k,j} - x_{k-1, j}}{s}, & k\geq 2 \end{matrix}\right.
+\end{equation}
+\begin{equation}
+\ddot{x}_{k,j} = \left\{\begin{matrix} 0, & k = 1\\ \frac{\dot{x}_{k,j} - \dot{x}_{k-1, j}}{s}, & k\geq 2 \end{matrix}\right.  
+\end{equation}
+Now, for each action sequence, we have formed the uniform-sized pose tensor $\mathbf{T} \in \mathbf{R}^{K \times 3L \times 3}$. 
+
+\subsubsection{Pose Processing}
+
+Often is the case that the pose data obtained from pose estimator come with some flaws, such as missing joint (occulusion), outliers and so on. Therefore \textit{Data Manager} will perform pose spatial interpolation, temporal smoothing as well as normalization before the pose tensor is sent for action prediction. 
+
+\textbf{Temporal Smoothing of Pose}
+
+Videos contain rich motion information that covers the smooth movement of human joints. Because of this movement, some invisible joints become visible in continuous frames or some visible joints become invisible due to self or object occlusion. The interpolation scheme is based on the assumption that the movement of joints is linear for small temporal range of frames. Therefore, by utilizing the available joints in small temporal range of frames $F$, the position of missing joint positions can be interpolated from small temporally neighboured frames. A P-Spline interpolation\footnote{\url{https://en.wikipedia.org/wiki/Smoothing_spline}} is used to estimate the location of missing joint positions. The interpolation uses valid joint positions in temporal range of $F$ frames for estimating missing joint positions. Missing joint position for a particular joint $j$ is interpolated by using the \texttt{scipy.interpolate.UnivariateSpline} class in \texttt{Scipy} library\footnote{\url{https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.UnivariateSpline.html}}. Figure \ref{fig:pose_smoothing} displays how P-Spline smoothing recovers a single missing joint along the timeline of 10 frames.  
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=1.0\linewidth]{PipelineDesign/FeatureExtractor/pose_smoothing.png}
+  \caption{An example of temporal P-Spline smoothing. Before smoothing (blue), the first 10 frames of 
+           the joint x position are: [123.908, 123.259, 0., 0., 0., 0., 0., 119.357 116.73, 121.292],  
+           After smoothing (green), the values are: [123.71374527 123.55038209, 122.86919667,
+           121.85577574, 120.69570604, 119.5745743, 118.67796725, 118.19147164, 118.47829254,
+           120.61210846]. The missing points in frame 2 to 6 have been smoothingly interpolated.}
+  \label{fig:pose_smoothing}
+\end{figure} 
+
+\textbf{Spatial Interpolation of Pose}
+
+However, temporal interpolation has its limitation for long-term occluded human joints. If some joints are not detected for a long temporal range, the linear motion assumption for temporal interpolation will not be valid any more. Therefore, for the cases without information of the corresponding missing joint positions in some other frames, an additional interpolation is carried out. As proposed in \cite{usman2018}, this interpolation uses the available joint positions in the same frame to estimate missing joint positions in that frame. The idea is based on the observation that the location of human joints are strongly correlated with each other especially the neighbouring joints, such as shoulder and elbow joints. Inspired by the work in \cite{Muller2010}, neighbourhood relationships of joints are utilized to vote for possible location of missing joints. 
+
+A polynomial curve fitting model is formulated that models the spatial relationship of neighboured joints. This model is learned from the varied video datasets with ground truth poses. Figure \ref{fig:stat_model} shows the statistical polynomial curve fitting model learned for the estimation of location of \textit{Left Ankle} joint. \ref{fig:stat_model}(a) shows the correlation of normalized $x$-coordinate of \textit{Left Hip} joint and normalized $x$-distance between \textit{Left Hip} and \textit{Left Ankle} joint. The blue dots denote the data points for normalized $x$-distance between \textit{Left Hip} and \textit{Left Ankle} with respect to normalized $x$-coordinate of \textit{Left Hip} joint, for all the poses in dataset. The red line shows the curve fitting model learned from the data points. The similar curve fitting model is learned from the data points of the normalized $y$-coordinate of \textit{Left Hip} joint and normalized $y$-distance between \textit{Left Hip} and \textit{Left Ankle} joint as shown in Figure \ref{fig:stat_model}(b).
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=1.0\linewidth]{PipelineDesign/FeatureExtractor/stat_model.png}
+  \caption{Statistical curve fitting model for relative relative joint positions of \textit{Left Ankle}
+           and \textit{Left Hip} joints. (a) Polynomial Curve fitting model for estimation of $x$-
+           coordinate of \textit{Left Ankle} joint using \textit{Left Hip} joint (b) Polynomial Curve 
+           fitting model for estimation of $y$-coordinate of \textit{Left Ankle} joint using 
+           \textit{Left Hip joint}. \cite{usman2018}}
+  \label{fig:stat_model}
+\end{figure} 
+
+As direct neighboured joints have strong correlation, the whole body is divided into 5 body parts keeping their tight neighbourhood relationships intact as shown in Figure \ref{fig:body_model_config}. Body part 1 to 4 has tight spatial neighbourhood relationship but body part 5 has loose neighbourhood relationship. For a missing joint position within frame, firstly all the available joint positions in the corresponding body part of tight neighbourhood relationship (part 1 to part 4) are selected to estimate the missing joint position. If no joint position in corresponding part is available, then joints from body part 5 are selected for the estimation of missing upper body joints. For all other cases, all the available joint positions in that frame are selected for estimation of missing joint. Each available joint in respective body part votes for the missing joint position and all the votes of selected joints are averaged to find the final estimation of missing joint.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.4\linewidth]{PipelineDesign/FeatureExtractor/body_model_config.png}
+  \caption{Configuration of 5 body parts for spatial interpolation of missing joint positions
+           \cite{usman2018}}
+  \label{fig:body_model_config}
+\end{figure} 
+
+Figure \ref{fig:pose_smoothing_result} shows the effects of pose spatial interpolation and temporal smoothing.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.8\linewidth]{PipelineDesign/FeatureExtractor/pose_smoothing_result.png}
+  \caption{Complete body pose after temporal and spatial interpolation (a) Missing pose in some frames
+           estimated by temporal interpolation (b) Occluded joint positions estimated by spatial
+           interpolation (c) Missing joint positions in some frame estimated by temporal interpolation
+           \cite{usman2018}}
+  \label{fig:pose_smoothing_result}
+\end{figure} 
+
+\textbf{Pose Normalization} 
+
+The 2D joint positions of humans are simply the image coordinates $(x, y)$ of the corresponding joints. These image coordinates are sensitive to camera perspectives and image resolution. Thus a normalization is required, which keeps all the poses to be of similar size and to be at the centre of the image. As given in Eqution \ref{eqa:pose_norm}, all n joint positions of the body are normalized with respect to image coordinate system in the range of $[-1, 1]$, to get rid of the dependency of pose to video resolution \cite{usman2018}.
+
+\begin{equation}
+\hat{P}_{i(x,y)} = 2 \times \frac{OP_{i(x,y)}}{(I_{w}, I_{h})} - 1, \;\;\; \forall i = 1, \dots , n
+\label{eqa:pose_norm}
+\end{equation}
+
+where $I_{w}$ and $I_{h}$ correspond to width and height of frame respectively. $OP_{(x,y)}$ is the
+joint positions in original image coordinate. These normalized joint positions $\hat{P}_{(x,y)}$ are then scaled with respect to torso length as follows: 
+
+\begin{equation}
+\bar{P}_{i(x,y)} = \frac{\hat{P}_{i(x,y)}}{d}, \;\;\; \forall i = 1, \dots, n
+\end{equation}
+
+with, 
+\begin{equation}
+d = \sqrt{(\hat{x}_{neck} - \hat{x}_{belly})^2 + (\hat{y}_{neck} - \hat{y}_{belly})^2}
+\end{equation} 
+
+Finally, these rescaled joints $\bar{P}_{(x,y)}$ are shifted at the center of torso, given below:
+\begin{equation}
+\hat{P}_{torso(x,y)} = \frac{\bar{P}_{neck(x,y)} + \bar{P}_{belly(x,y)}}{2}
+\end{equation} 
+\begin{equation}
+P_{i(x,y)} = \bar{P}_{i(x,y)} - \bar{P}_{torso(x,y)}, \;\;\; \forall i = 1, \dots, n
+\end{equation}
+
+$P_{i(x,y)}$ is the normalized, scaled and shifted joint positions for all joints, as shown in Figure \ref{fig:pose_norm}. These normalized joint positions $P_{i(x,y)}$ are then used to form pose tensor as described above.   
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.7\linewidth]{PipelineDesign/FeatureExtractor/pose_norm.png}
+  \caption{Pose Normalization \cite{usman2018}}
+  \label{fig:pose_norm}
+\end{figure}  
+
+\subsubsection{Data\_manager Package}
+In this module we created one ROS package --- \textit{data\_manager} with two nodes: \texttt{data\_manager\_2d} for 2D pose and \texttt{data\_manager\_3d} for 3D pose. Figure \ref{fig:data_manager} shows the computaion graph of \textit{data\_manager} package.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/FeatureExtractor/data_manager.png}
+  \caption{ROS Topics and Messages in \texttt{data\_manager\_2d} and \texttt{data\_manager\_3d} nodes}  
+  \label{fig:data_manager}
+\end{figure}  
+
+\textbf{Implementation Details}
+
+Since these two nodes have similar structures, we take \texttt{data\_manager\_3d} as example. First we extract person ID and person pose information from the tracking info message. Then we will determin if the person has already appeared before. In order to store the ID and pose data for each person, we create a pose pool as container, its structure is shown in Table \ref{tab:pose_pool}. \\
+
+\begin{table}[h!]
+\begin{tabular}{|c|c|l|l|l|}
+\hline
+\texttt{Dict} & \multicolumn{4}{c|}{\texttt{Pose Pool}}                                                                                                                                                \\ \hline
+\begin{tabular}[c]{@{}c@{}}\texttt{person id}\\ \texttt{(key)}\end{tabular} & \texttt{0} & \texttt{1} & \texttt{2} & \texttt{...} \\ \cline{2-5} 
+\begin{tabular}[c]{@{}c@{}}\texttt{pose\_pool}\\ \texttt{(item member)}\end{tabular} & 
+\begin{tabular}[c]{@{}c@{}}...\\ \texttt{frame i}: \texttt{{[}..., x\_i\_n, y\_i\_n, z\_i\_n, ...{]}}\\ \texttt{frame j}: \texttt{{[}..., x\_j\_n, y\_j\_n, z\_j\_n, ...{]}}\\ ...\end{tabular} & \texttt{...} & \texttt{...} & \texttt{...} \\ \cline{2-5} 
+\begin{tabular}[c]{@{}c@{}}\texttt{sample\_id}\\ \texttt{(item member)}\end{tabular} & \texttt{{[}..., i, j, ...{]}} & \texttt{...} & \texttt{...} & \texttt{...} \\ \hline
+\end{tabular}
+\caption{\textbf{Data structure of Pose Pool}. Pose Pool is no more than a dictionary (Python) or map (C++). Person ID is used as the key, each time \texttt{data\_manager\_3d} receives the person pose from \textit{Pose Estimator}, it will first check if the person has already a record in the Pose Pool. If not, the Pose Pool will create a block for the person, otherweise Pose Pool will update the person's \texttt{pose\_pool}. The \texttt{pose\_pool} of each person is a concatenated array of pose data from different frames, and the pose data of each frame is an array of $(x, y, z)$ of all joints in the node sequence (e.g. in Figure \ref{fig:pose_topo}). While another item member --- \texttt{sample\_id} determines which frame should be handled. As default in our pipeline, we will process every single frame, so the \texttt{sample\_id} list would be: [0, 1, 2 , 3, ...], at the end of the pose processing, the next sample id that should be handled will be generated and be appended to \texttt{sample\_id} list. Once a person's \texttt{pose\_pool} has achieved a predefined number K (here we set K = 10), we will generate the pose tensor from the K frames with pose processing as mentioned above. Then we store the pose tensor in the \texttt{Person} message or gather all the persons in one \texttt{FrameInfo} message and publish it. At last we remove the first frame in the person's \texttt{pose\_pool}, and concatenate the coming pose frame to the end of it, so as to form a new pose tensor, while reserving previous $K-1$ pose frames.}
+\label{tab:pose_pool}
+\end{table}
+
+
+\textbf{APIs Summary}
+
+ROS node: \texttt{data\_manager\_3d}
+
+\begin{itemize}
+
+\item[•] Subscriber \\
+Topic: \texttt{/pose\_3d\_ros/frame\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: frame info with frame ID, image frame, person ID, bounding box, pose keypoints and confidence \\
+\texttt{--------} \\
+Topic: \texttt{/pose\_3d\_ros/person} \\
+Message type: \texttt{message\_repository/Person} \\
+Message: single person message with frame ID, person ID, bounding box, pose keypoints and confidence
+
+\item[•] Publisher \\
+Topic: \texttt{/data\_manager\_3d/person} \\ 
+Message type: \texttt{message\_repository/Person} \\
+Message: single person message with person ID and pose tensor \\
+\texttt{--------} \\
+Topic: \texttt{/data\_manager\_3d/frame\_info} \\
+Message type:  \texttt{message\_repository/FrameInfo} \\
+Message: frame info message with all persons with their own ID and pose tensor  
+
+\item[•] Main Parameters \\
+\texttt{$\sim$frame\_info\_topic}: set topic for frame info message subscriber \\
+\texttt{$\sim$person\_topic}: set topic for person message susbcriber \\
+\texttt{$\sim$tensor\_length}: define the number of frames in one pose tensor, default: 10 \\
+\texttt{$\sim$tensor\_offset}: define the start frame of pose tensor, default: 0 \\
+\texttt{$\sim$tensor\_stride}: define the stride between two consecutive to-be-handled frames, default: 1 \\
+\texttt{$\sim$node\_sequence}: specify the traversal sequnce
+\end{itemize}
+
+% ------------------------------------------%
+% action predictor module
+\subsection{Action Predictor}
+\label{pipeline:AP}
+After the generation of pose tensor, the last step we will take is to feed the pose tensor to the PoseNet in \textit{Action Predictor}. 
+
+\subsubsection{Network Structure}
+
+In our pipeline, two PoseNets will be utilized for action classification, one for 2D pose and the other for 3D pose.
+
+\textbf{PoseNet for 2D Pose}
+
+A Pose ConvNet is proposed by \cite{usman2018}, which is trained end-to-end by taking pose tensor as input and action scores as output. As shown in Figure \ref{fig:posenet_2d}, the Pose ConvNet architecture is a shallow network because pose tensors contain highly compact data and consists of high-level features. 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/FeatureExtractor/posenet_2d.png}
+  \caption{Architecture of Pose ConvNet \cite{usman2018}}  
+  \label{fig:posenet_2d}
+\end{figure}  
+
+
+\textbf{PoseNet for 3D Pose}
+
+Another PoseNet for 3D pose based action classification is proposed in the work \cite{lin2018}, which consists of two convolutional layers along with two max pooling layers and two fully connected layers.
+The architecture is illustrated in Figure \ref{fig:posenet_3d}.  
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.3\linewidth]{PipelineDesign/FeatureExtractor/posenet_3d.png}
+  \caption{\textbf{Architecture of PoseNet}. A CNN of two Conv layers, two Max Pooling layers and two
+           FC layers. Hyperparameters such as number of kernels in Conv layers and size of FC layers
+           are determined according the scale of the dataset. \cite{lin2018}}  
+  \label{fig:posenet_3d}
+\end{figure} 
+
+
+\subsubsection{Action Proposal}
+
+Now we will get one action label per frame (except for the first K = 10 frames), but what we really need is the beginning and ending of some action. In our pipeline, we generate the pose tensor based on 10 consecutive frames, which is unavoidably noisy, as the completion of an action usually takes certain mount of time (frames), while in such a short period of time, some misunderstanding will probably appear. An example is illustrated in Figure \ref{fig:action_proposal_s1}, if we just take the prediction label of each pose tensor, we will get a very noisy and less reasonable result, as denoted in green in bottom diagram. Inspired by the work \cite{DBLP:journals/corr/XiongZWLT17}, we proposed an action proposal strategy, which effectively reduces the prediction noise, as shown in Figure \ref{fig:action_proposal_s1} bottom diagram (red).      
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=1.0\linewidth]{PipelineDesign/FeatureExtractor/action_proposal_s1.png}
+  \caption{Action Classification with and without Proposal. The top diagram displays the action score
+           of the action standing (green) and walking (red) along the timeline (frames) respectively. 
+           The bottom diagram shows the action label (action with higher scores, 0 -- standing, 1 --
+           walking) of each frame, the green one stands for the prediction based on the current pose
+           tensor, while the red one stands for the proposed label.}  
+  \label{fig:action_proposal_s1}
+\end{figure}   
+
+Our action grouping algorithm (only for standing and walking) is illustrated as pseudo code \ref{alg:pose_proposal}. Here $\tau$ is the action threshold, which means when the frame label (predicted based on current pose tensor) is different from last proposed label, only if when the new action score is no less than $\tau$ can it be taken as valid and increase the count by 1, so as to tell the algorithm that the frame label may be true, rather than a noise or an outlier value. When the count value achieves the tolerance threshold $\gamma$, the frame label is taken as the new valid action label. However, this algorithm also comes with some drawbacks. One of them is, the parameters of $\tau$ and $\gamma$ is not easy to set for all scenarios. Another drawback says, if a new reasonable action appears, it still takes at least $\gamma$ frames to switch to the new action prediction, so as to show a delay for the prediction. There is always a compromise to be made between noise reduction and high sensitivity (once a change in action happens, the algorithm should resond to it as soon as possible).    
+\begin{algorithm}[h!]
+\SetAlgoLined
+\KwResult{Proposed action label} 
+set proposedLabel = None\;
+set proposedLabelList = None\;
+set frameLabel = None\;
+set standingScore = 0\;
+set walkingScore = 0\;
+set $\tau$ = 0.5\;
+set $\gamma$ = 10\;
+set count = 0\;  
+\While{True}{
+  standingScore = getStandingScore()\;
+  walkingScore = getWalkingScore()\;
+  frameLabel = getFrameLabel()\;  
+  \If{first prediction}
+  {
+    proposedLabel = frameLabel\;
+  }  
+  \Else
+  {
+    \If{proposedLabelList[-1] == frameLabel}
+    {
+      proposedLabel = frameLabel\;  
+      count = 0\;  
+    }
+    \Else
+    {
+      \If{standingScore >= $tau$ and count >= $\gamma$}
+      {
+	    proposedLabel = standing\;
+	    count = 0\;       
+      }
+      \ElseIf{walkingScore >= $tau$ and count >= $\gamma$}
+      {
+        proposedLabel = walking\;
+        count = 0\;       
+      }
+      \Else
+      {
+   		proposedLabel = proposedLabelList[-1]\;      
+      } 
+    } 
+  }
+  
+  proposedLabel.append(proposedLabel)\;
+ }
+\caption{Action Grouping Algorithm}
+\label{alg:pose_proposal}
+\end{algorithm}      
+
+\subsubsection{Pose\_net Package}
+
+Similar to \texttt{data\_manager}, \texttt{pose\_net} also has two nodes, one for 2D pose and the other for 3D pose. Figure \ref{fig:pose_net} shows the computation graph of \texttt{pose\_net} package. 
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/ActionPredictor/pose_net.png}
+  \caption{ROS Topics and Messages in \texttt{pose\_net\_2d} and \texttt{pose\_net\_3d} node}  
+  \label{fig:pose_net}
+\end{figure}   
+
+\textbf{Implementation Details} 
+
+In our pipeline, we have currently tested and evaluated the 3D pose, for which we have trained several models. In one of the models, we add some data jittering augmentation at the training stage, trying to compensate the instability of camera perspectives and the tracking bounding box. Another model is trained with pose tensor generated with stride 1, which works exactly as runtime process. Some results and evalutions will be further discussed in Section \ref{sec:eval}. Similar to the \texttt{Pose Pool} data structure, we employ an \texttt{Action Pool} container to store the proposed action label and the corresponding frame ID, so as to make the online action proposal easier. As \texttt{pose\_net\_2d} and \texttt{pose\_net\_3d} node share similar APIs, we take \texttt{pose\_net\_3d} as example to explain the APIs. 
+
+\textbf{APIs Summary}
+
+ROS node: \texttt{pose\_net\_3d}
+
+\begin{itemize}
+\item[•] Subscriber \\
+Topic: \texttt{/data\_manager\_3d/frame\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: all persons with their ID and pose tensor \\
+\texttt{--------} \\
+Topic: \texttt{/data\_manager\_3d/person} \\
+Message type: \texttt{message\_repository/Person} \\
+Message: single person message with person ID and pose tensor
+
+\item[•] Publisher \\
+Topic: \texttt{/pose\_net\_3d/person} \\
+Message type: \texttt{message\_repository/Person} \\
+Message: single person message with person ID and person action label \\
+\texttt{--------} \\
+Topic:  \texttt{/pose\_net\_3d/frame\_info} \\
+Message type: \texttt{message\_repository/FrameInfo} \\
+Message: frame info message with all persons with their own ID and action label 
+
+\item[•] Main Parameters \\
+\texttt{$\sim$frame\_info\_topic}: set topic for frame info message subscriber \\
+\texttt{$\sim$person\_topic}: set topic for single person message susbcriber \\
+\texttt{$\sim$pose\_model}: specify the PoseNet model
+
+\item[•] Main Flags \\
+\texttt{---plot\_action}: set true to plot action proposal online
+\end{itemize}
+
+% ------------------------------------------%
+% visual agency module
+\subsection{Visual Agency}
+\label{pipeline:VA}
+The very basic idea behind this module is that, the other modules can focus on their main functions and leave the job of visualization, logging or other data IO to \textit{Visual Agency}, which is also of great importance for testing and debugging the pipeline. 
+
+\subsubsection{Visual\_agency Package}
+
+In this package, we now have a \texttt{visual\_agency} node, which subscribes to several topics in the pipeline. As shown in Figure \ref{fig:visual_agency}, it basically visualizes the results, especially rendered image with different information, from different modules.    
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.9\linewidth]{PipelineDesign/VisualAgency/visual_agency.png}
+  \caption{ROS Topics and Messages in \texttt{visual\_agency} node}  
+  \label{fig:visual_agency}
+\end{figure}  
+
+\textbf{Implementation Details}
+
+Though the \texttt{visual\_agency} node provides multiple options for visualizing different images, but 
+the message on topic \texttt{/pose\_net\_2d/frame\_info} and \texttt{/pose\_net\_3d/frame\_info} has contained all the needed information that is defined in the \texttt{FrameInfo.msg}. Instead of setting different subscribers, a better option is to set different flags for showing the corresponding images or data based on the frame info message from \textit{Visual Agency}. 
+
+\textbf{APIs Summary}
+
+ROS node: \texttt{visual\_agency}
+
+\begin{itemize}
+\item[•] Subscriber \\
+Topic: \texttt{/pose\_net\_3d/frame\_info} and  \\
+Message types: \texttt{message\_repository/FrameInfo} \\
+Message: all persons with frame ID, image frame, person ID, person bounding box, person action, etc. as described in message definition of \texttt{FrameInfo.msg} \\
+\texttt{--------} \\
+Topic: \texttt{/pose\_net\_3d/person} \\
+Message type: \texttt{message\_repository/Person} \\
+Message: single person message with frame ID, person ID, person image, person action in the frame. \\
+\texttt{--------}\\
+Topic: image topics in the pipeline as shown in Figure \ref{fig:visual_agency} \\
+Message type: \texttt{sensor\_msgs/Image} \\
+Message: images rendered with multiple information
+
+\item[•] Main Parameters \\
+\texttt{$\sim$frame\_info\_topic}: set topic for FrameInfo message subscriber \\
+\texttt{$\sim$person\_topic}: set topic for Person message susbcriber \\
+\texttt{$\sim$image\_topic}: set topic for image message subscriber 
+
+\item[•] Flags \\
+\texttt{---visual\_raw\_image}: visualize original raw image frame \\
+\texttt{---visual\_detection}: visualize image rendered with detection bounding box and confidence \\
+\texttt{---visual\_tracking}: visualize image rendered with tracking bounding box and person ID \\
+\texttt{---visual\_action}: visualize image rendered with person action label \\
+\texttt{---write\_video}: write output video with image rendered with action \\
+\texttt{---write\_det\_file}: write detection list into file \\
+\texttt{---write\_track\_file}: write tracking list into file \\
+\texttt{---write\_action}: write action label into file
+\end{itemize}
+
+% ------------------------------------------%
+% pipeline utilities module
+\subsection{Pipeline Utilities}
+This module holds all other packages or modules that are utilized as auxiliary roles. Apart from the \textit{Message Repository} introduced above, \texttt{test\_n\_debugger}, \textit{3rdPartyLibs} together with \texttt{rp\_utilities} consititute the rest of module \textit{Pipeline Utilities}. \texttt{test\_n\_debugger} is mainly created for managing all tests (unittest\footnote{\url{https://docs.python.org/3/library/unittest.html}}, gtest\footnote{\url{https://github.com/google/googletest}}) and conducting experiments, while \textit{3rdPartyLibs} contains the main libraries that are used in the pipeline, e.g. OpenPose, Darknet (YOLO), PersonTracker, etc. The \texttt{rp\_utilities} package includes some ROS-related utilities, such as launch file, bag file and so on.
